@@ -1,0 +1,95 @@
+name: Build and Deploy to ECS
+
+on:
+  push:
+    branches: [main]
+
+env:
+  AWS_REGION: eu-north-1
+  ECR_REPOSITORY: ecs-cicd-lab
+  ECS_TASK_FAMILY: ecs-cicd-lab-task
+  CONTAINER_NAME: web
+  ARTIFACT_KEY: deploy/appspec-artifact.zip
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write   # required for OIDC token
+      contents: read
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Resolve account-specific values
+        id: vars
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          echo "account_id=${ACCOUNT_ID}" >> $GITHUB_OUTPUT
+          echo "artifact_bucket=ecs-cicd-lab-artifacts-${ACCOUNT_ID}" >> $GITHUB_OUTPUT
+          echo "execution_role=arn:aws:iam::${ACCOUNT_ID}:role/ecs-cicd-lab-ecs-task-execution-role" >> $GITHUB_OUTPUT
+          echo "task_role=arn:aws:iam::${ACCOUNT_ID}:role/ecs-cicd-lab-ecs-task-role" >> $GITHUB_OUTPUT
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build Docker image
+        env:
+          IMAGE_URI: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+        run: docker build -t "$IMAGE_URI" .
+
+      - name: Register ECS task definition
+        id: register-task
+        env:
+          IMAGE_URI: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+          EXECUTION_ROLE: ${{ steps.vars.outputs.execution_role }}
+          TASK_ROLE: ${{ steps.vars.outputs.task_role }}
+        run: |
+          sed -e "s|IMAGE_URI|${IMAGE_URI}|g" \
+              -e "s|EXECUTION_ROLE_ARN|${EXECUTION_ROLE}|g" \
+              -e "s|TASK_ROLE_ARN|${TASK_ROLE}|g" \
+              taskdef-template.json > taskdef.json
+
+          TASK_DEF_ARN=$(aws ecs register-task-definition \
+            --cli-input-json file://taskdef.json \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+
+          echo "task_def_arn=${TASK_DEF_ARN}" >> $GITHUB_OUTPUT
+
+      - name: Generate appspec.yaml
+        env:
+          TASK_DEF_ARN: ${{ steps.register-task.outputs.task_def_arn }}
+        run: |
+          cat > appspec.yaml <<EOF
+          version: 0.0
+          Resources:
+            - TargetService:
+                Type: AWS::ECS::Service
+                Properties:
+                  TaskDefinition: "${TASK_DEF_ARN}"
+                  LoadBalancerInfo:
+                    ContainerName: "${{ env.CONTAINER_NAME }}"
+                    ContainerPort: 80
+          EOF
+
+      - name: Upload deployment artifact to S3
+        env:
+          ARTIFACT_BUCKET: ${{ steps.vars.outputs.artifact_bucket }}
+        run: |
+          zip appspec-artifact.zip appspec.yaml
+          aws s3 cp appspec-artifact.zip "s3://${ARTIFACT_BUCKET}/${{ env.ARTIFACT_KEY }}"
+
+      # Push AFTER uploading the artifact — the ECR push triggers EventBridge → CodePipeline
+      - name: Push image to ECR
+        env:
+          IMAGE_URI: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+        run: docker push "$IMAGE_URI"

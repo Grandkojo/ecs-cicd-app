@@ -1,0 +1,27 @@
+{
+  "family": "ecs-cicd-lab-task",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "256",
+  "memory": "512",
+  "executionRoleArn": "EXECUTION_ROLE_ARN",
+  "taskRoleArn": "TASK_ROLE_ARN",
+  "containerDefinitions": [
+    {
+      "name": "web",
+      "image": "IMAGE_URI",
+      "essential": true,
+      "portMappings": [
+        { "containerPort": 80, "protocol": "tcp" }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/ecs-cicd-lab",
+          "awslogs-region": "eu-north-1",
+          "awslogs-stream-prefix": "ecs"
+        }
+      }
+    }
+  ]
+}
